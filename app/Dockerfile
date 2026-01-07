@@ -38,10 +38,9 @@ import torch
 print('Torch build:', torch.__version__, 'CUDA:', torch.cuda.is_available(), 'Device count:', torch.cuda.device_count())
 PY
 
-# Copy source code
-COPY src ./src
-COPY static ./static
-COPY templates ./templates
+# Copy entire app context (includes src, static, templates, tests, entrypoint)
+COPY . ./
+RUN chmod +x /app/entrypoint.sh
 
 RUN mkdir -p uploads job_state && chmod 755 uploads job_state
 VOLUME ["/app/uploads"]
@@ -54,4 +53,5 @@ RUN if [ "$PRELOAD_WEIGHTS" = "1" ]; then python -c "import torchvision.models a
 HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
     CMD python -c "import os,urllib.request,sys; b=os.environ.get('BASE_PATH','').rstrip('/'); url=f'http://127.0.0.1:8000{b if b else ''}/';\n  urllib.request.urlopen(url,timeout=3)" || exit 1
 
-CMD ["/bin/sh", "-c", "gunicorn -k uvicorn.workers.UvicornWorker -w ${ST_WORKERS:-1} -b 0.0.0.0:8000 src.server:app --timeout 300 || uvicorn src.server:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 300"]
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD []

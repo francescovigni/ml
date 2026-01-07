@@ -10,7 +10,6 @@ job_state
 .git
 .gitignore
 README.md
-tests
 image-stylization-with-inceptionv3.ipynb
 *.swp
 .DS_Store

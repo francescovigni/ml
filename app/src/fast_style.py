@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 
 import torch
 import torch.nn as nn
@@ -107,19 +107,22 @@ def available_styles() -> List[str]:
     return sorted(p.stem for p in d.glob("*.pth"))
 
 
+_MODEL_CACHE: Dict[str, TransformerNet] = {}
+
 def load_style_model(style_name: str) -> TransformerNet:
+    if style_name in _MODEL_CACHE:
+        return _MODEL_CACHE[style_name]
     path = _models_dir() / f"{style_name}.pth"
     if not path.exists():
         raise FileNotFoundError(f"Model weights not found: {path} (expected {style_name}.pth)")
     state = torch.load(path, map_location=DEVICE)
     net = TransformerNet().to(DEVICE)
-    # Some checkpoints may save with keys 'state_dict'
     if isinstance(state, dict) and 'state_dict' in state:
         state = state['state_dict']
-    # Remove potential 'module.' prefixes
     cleaned = {k.replace('module.', ''): v for k, v in state.items()}
     net.load_state_dict(cleaned, strict=False)
     net.eval()
+    _MODEL_CACHE[style_name] = net
     return net
 
 
@@ -127,11 +130,21 @@ _preprocess = T.Compose([
     T.ToTensor(),
 ])
 
-_postprocess = T.Compose([
-    T.Lambda(lambda t: t.clamp(0, 255)),
-    T.Lambda(lambda t: t / 255.0),
-    T.ToPILImage(),
-])
+def _postprocess_tensor(t: torch.Tensor) -> Image.Image:
+    t = t.detach().cpu().squeeze(0)
+    vmin = float(t.min().item())
+    vmax = float(t.max().item())
+    # Heuristic: handle common output ranges
+    if vmax <= 1.5 and vmin >= -1.5:
+        # Likely in [-1,1] or [0,1]
+        if vmin < 0.0:
+            t = (t + 1.0) / 2.0
+        t = t.clamp(0.0, 1.0)
+        return T.ToPILImage()(t)
+    else:
+        # Assume 0..255 float range
+        t = t.clamp(0.0, 255.0) / 255.0
+        return T.ToPILImage()(t)
 
 
 def fast_stylize(content_path: Path, style_name: str, max_size: int = 720) -> Image.Image:
@@ -140,13 +153,12 @@ def fast_stylize(content_path: Path, style_name: str, max_size: int = 720) -> Im
         scale = max_size / max(img.size)
         new_size = (int(img.width * scale), int(img.height * scale))
         img = img.resize(new_size, Image.LANCZOS)
-    t = _preprocess(img) * 255.0  # scale to 0-255 like many trainings
+    t = _preprocess(img) * 255.0  # common trainings expect 0..255 scale
     inp = t.unsqueeze(0).to(DEVICE)
     net = load_style_model(style_name)
     with torch.no_grad():
         out = net(inp)
-    out = out.squeeze(0).cpu()
-    return _postprocess(out)
+    return _postprocess_tensor(out)
 
 
 if __name__ == "__main__":

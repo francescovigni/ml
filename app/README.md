@@ -1,19 +1,19 @@
 # Neural Style Transfer FastAPI App
 
-A minimal FastAPI web application to perform neural style transfer using a VGG19-based optimization loop. Suitable for a demo deployment on a small VPS (with CPU it will be slow; GPU recommended for faster results).
+A FastAPI web app for neural style transfer. It defaults to a fast feed‑forward style model (one pre‑trained .pth per style) for sub‑30s CPU inference on small VPSes. If no fast model is available, it falls back to an iterative VGG19 optimization with a tiny step budget.
 
 ## Features
-- Upload content + style images via web form.
-- Adjustable steps and style weight.
-- Returns stylized image directly.
-- Simple, dependency-light (no database).
+- Upload content image (style image optional).
+- CPU‑friendly fast feed‑forward inference using pre‑trained models in `app/models`.
+- Enforced upload size limit (configurable).
+- Optional iterative fallback (reduced steps) when fast model is missing.
 
 ## Tech Stack
 - Python, FastAPI, Uvicorn
 - PyTorch + TorchVision (VGG19 features)
 - Frontend: vanilla HTML/CSS/JS
 
-## Setup
+## Setup (Local)
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # (macOS/Linux)
@@ -22,6 +22,8 @@ pip install -r requirements.txt
 ```
 
 If running on a CPU-only VPS you may want to install the CPU wheels for torch explicitly (see https://pytorch.org for the right command). The pinned versions here target recent PyTorch.
+
+Place one or more fast style model weights (`*.pth`) in `app/models/`. Example names: `mosaic.pth`. Set `ST_DEFAULT_STYLE_NAME` to the model name without extension.
 
 ## Run (Dev)
 ```bash
@@ -84,14 +86,18 @@ docker run --rm -p 8000:8000 -v "$PWD/uploads":/app/uploads style-transfer-app:l
 
 Pre-pulling VGG19 weights occurs at build; to disable remove the corresponding RUN line in `Dockerfile`.
 
-For heavier traffic or faster inference, replace the iterative optimization with a pre-trained fast style transfer network (e.g. Johnson et al. 2016) and precompute multiple style models.
+This image supports fast feed‑forward models out of the box via `app/models/*.pth`.
 
 ## Environment Variables
-None required currently.
+- `ST_DEFAULT_STYLE_NAME`: Name of the fast style model (e.g., `mosaic`). If unset, first available model is used. If no model is found, iterative fallback is used.
+- `ST_MAX_UPLOAD_MB`: Max per‑file upload size in MB (default `5`).
+- `ST_FAST_MAX_SIDE`: Max longer side (pixels) for fast inference resize (default `720`). Lower for smaller VPS (e.g., `640`).
+- `ST_WORKERS`: Background job workers (default `1`). Keep `1` for 1 GB RAM VPS.
+- `BASE_PATH`: Serve under a subpath when behind a reverse proxy (e.g., `/ml`).
 
 ## Notes
-- Iterative optimization (default 200 steps) on CPU may take several minutes. Reduce steps or deploy a GPU instance.
-- The current implementation processes one request fully in memory. For concurrency, you could queue jobs (e.g., with Celery or asyncio task queue) and stream progress via Server-Sent Events or WebSockets.
+- On a 1 GB CPU‑only VPS, use fast models with `ST_FAST_MAX_SIDE=640..720` to keep inference well under 30 seconds.
+- The iterative fallback is intentionally limited (low steps) and only used when no fast model is available.
 
 ## License
 MIT (add a LICENSE file if you want explicit licensing).

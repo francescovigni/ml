@@ -8,6 +8,11 @@ services:
     environment:
       - BASE_PATH=/ml
       - PYTHONUNBUFFERED=1
+      - ST_DEFAULT_STYLE_NAME=mosaic
+      - ST_MAX_UPLOAD_MB=5
+      - ST_FAST_MAX_SIDE=720
+      - ST_WORKERS=1
+      - RUN_TESTS_ON_START=1
     # Map host port 8006 -> container 8000 (adjust to free port on host)
     ports:
       - "8006:8000"

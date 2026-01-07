@@ -5,13 +5,15 @@ import json
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
+import logging
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .style_transfer import stylize_with_progress
+from .fast_style import fast_stylize, available_styles
 
 # Allow serving under a path prefix (e.g. /ml) behind Caddy or another reverse proxy.
 # In Caddy you will typically:
@@ -40,6 +42,17 @@ JOBS_DIR.mkdir(exist_ok=True)
 PERSIST_JOBS = os.getenv("ST_PERSIST_JOBS", "1") not in {"0", "false", "False"}
 PERSIST_STEP_INTERVAL = int(os.getenv("ST_PERSIST_STEP_INTERVAL", "5"))
 OUTPUT_JPEG_QUALITY = int(os.getenv("ST_OUTPUT_JPEG_QUALITY", "88"))
+MAX_UPLOAD_MB = int(os.getenv("ST_MAX_UPLOAD_MB", "5"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+# Fast style defaults to ensure <30s latency on CPU
+DEFAULT_STYLE_NAME = os.getenv("ST_DEFAULT_STYLE_NAME")
+FAST_MAX_SIDE = int(os.getenv("ST_FAST_MAX_SIDE", "720"))
+
+# Basic logging setup (may be superseded by process-level config)
+LOG_LEVEL = os.getenv("ST_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logger = logging.getLogger("style_server")
 
 static_dir = StaticFiles(directory=str(BASE_DIR / "static"))
 # Always mount base /static (works when proxy strips prefix)
@@ -65,18 +78,28 @@ async def ping():
 @app.get("/", response_class=HTMLResponse)
 async def index_root(request: Request):
     prefix = _determine_prefix(request)
-    return templates.TemplateResponse("index.html", {"request": request, "prefix": prefix})
+    styles = available_styles()
+    style_name = DEFAULT_STYLE_NAME or (styles[0] if styles else None)
+    return templates.TemplateResponse(
+        "index.html",
+        {"request": request, "prefix": prefix, "max_upload_mb": MAX_UPLOAD_MB, "fast_style_name": style_name}
+    )
 
 if BASE_PATH:
     @app.get(f"{BASE_PATH}/", response_class=HTMLResponse)
     async def index_prefixed(request: Request):  # type: ignore
         prefix = _determine_prefix(request)
-        return templates.TemplateResponse("index.html", {"request": request, "prefix": prefix})
+        styles = available_styles()
+        style_name = DEFAULT_STYLE_NAME or (styles[0] if styles else None)
+        return templates.TemplateResponse(
+            "index.html",
+            {"request": request, "prefix": prefix, "max_upload_mb": MAX_UPLOAD_MB, "fast_style_name": style_name}
+        )
 
 
 _JOBS: dict[str, dict[str, Any]] = {}
-_JOB_LOCK = asyncio.Lock()
-_JOB_QUEUE: "asyncio.Queue[tuple[str, Path, Path, int, float]]" = asyncio.Queue()
+_JOB_LOCK: Optional[asyncio.Lock] = None
+_JOB_QUEUE: Optional["asyncio.Queue[tuple[str, Path, Path, int, float]]"] = None
 WORKER_COUNT = int(os.getenv("ST_WORKERS", "1"))
 
 # ---------------- Persistence Helpers ---------------- #
@@ -138,6 +161,8 @@ def _ensure_job_loaded(job_id: str) -> Optional[dict]:
 
 async def _save_upload(file: UploadFile, path: Path):
     data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large. Max {MAX_UPLOAD_MB} MB")
     with open(path, 'wb') as f:
         f.write(data)
 
@@ -175,19 +200,54 @@ def _run_style_job(job_id: str, content_path: Path, style_path: Path, steps: int
         if PERSIST_JOBS and (info['step'] % PERSIST_STEP_INTERVAL == 0 or info.get('preview_step')):
             _persist_job(job_id)
     try:
-        img = stylize_with_progress(
-            content_path,
-            style_path,
-            steps=steps,
-            style_weight=style_weight,
-            progress_cb=cb,
-            callback_every=1,
-            should_cancel=lambda: _JOBS.get(job_id, {}).get('status') == 'cancelling',
-            preview_every=25,
-        )
+        # Prefer fast feed-forward model to meet 30s SLA
+        style_to_use = DEFAULT_STYLE_NAME
+        if not style_to_use:
+            styles = available_styles()
+            style_to_use = styles[0] if styles else None
+        if style_to_use:
+            logger.info(f"Job {job_id}: using fast style model '{style_to_use}', max_side={FAST_MAX_SIDE}")
+            job.update({'status': 'running', 'note': f'fast:{style_to_use}'})
+            img = fast_stylize(content_path, style_to_use, max_size=FAST_MAX_SIDE)
+            # Detect blank/near-uniform outputs and fallback to iterative if needed
+            try:
+                import numpy as np
+                std_l = np.asarray(img.convert('L')).std()
+                if std_l < 1.5:
+                    logger.warning(f"Job {job_id}: fast output appears blank (std={std_l:.3f}); falling back to iterative")
+                    steps = min(steps or 100, 60)
+                    job.update({'status': 'running', 'total_steps': steps, 'note': f'fallback-iter'})
+                    img = stylize_with_progress(
+                        content_path,
+                        style_path,
+                        steps=steps,
+                        style_weight=1_000_000.0,
+                        progress_cb=cb,
+                        callback_every=5,
+                        should_cancel=lambda: _JOBS.get(job_id, {}).get('status') == 'cancelling',
+                        preview_every=None,
+                    )
+            except Exception:
+                pass
+        else:
+            # Fallback to iterative with very small budget (may be slower/poorer quality)
+            steps = min(steps or 100, 60)
+            logger.info(f"Job {job_id}: fast model not found, fallback iterative steps={steps}")
+            job.update({'status': 'running', 'total_steps': steps})
+            img = stylize_with_progress(
+                content_path,
+                style_path,
+                steps=steps,
+                style_weight=1_000_000.0,
+                progress_cb=cb,
+                callback_every=5,
+                should_cancel=lambda: _JOBS.get(job_id, {}).get('status') == 'cancelling',
+                preview_every=None,
+            )
         if _JOBS.get(job_id, {}).get('status') == 'cancelling':
             job['status'] = 'cancelled'
             _persist_job(job_id)
+            logger.info(f"Job {job_id}: cancelled by client")
             return
         buf = BytesIO()
         img.save(buf, format='JPEG', quality=OUTPUT_JPEG_QUALITY, optimize=True)
@@ -195,6 +255,7 @@ def _run_style_job(job_id: str, content_path: Path, style_path: Path, steps: int
         job['result'] = buf
         job['status'] = 'finished'
         job['elapsed_total'] = time.time() - start
+        logger.info(f"Job {job_id}: finished in {job['elapsed_total']:.2f}s, size={len(buf.getvalue())} bytes")
         if PERSIST_JOBS:
             with open(_job_result_path(job_id), 'wb') as rf:
                 rf.write(buf.getvalue())
@@ -202,6 +263,7 @@ def _run_style_job(job_id: str, content_path: Path, style_path: Path, steps: int
     except Exception as e:
         job['status'] = 'error'
         job['error'] = str(e)
+        logger.exception(f"Job {job_id}: error during processing: {e}")
         _persist_job(job_id)
     finally:
         try:
@@ -213,6 +275,8 @@ def _run_style_job(job_id: str, content_path: Path, style_path: Path, steps: int
 
 async def _job_worker():
     while True:
+        while _JOB_QUEUE is None:
+            await asyncio.sleep(0.01)
         spec = await _JOB_QUEUE.get()
         if spec is None:  # shutdown signal
             _JOB_QUEUE.task_done()
@@ -229,13 +293,16 @@ async def _job_worker():
 @app.on_event("startup")
 async def _startup():
     # Launch worker coroutines
+    global _JOB_QUEUE, _JOB_LOCK
+    _JOB_QUEUE = asyncio.Queue()
+    _JOB_LOCK = asyncio.Lock()
     for _ in range(max(1, WORKER_COUNT)):
         asyncio.create_task(_job_worker())
 
 @app.post("/stylize")
 async def enqueue_stylize(
     content_image: UploadFile = File(...),
-    style_image: UploadFile = File(...),
+    style_image: UploadFile = File(None),
     steps: int = Form(200),
     style_weight: float = Form(1_000_000.0),
 ):
@@ -243,19 +310,44 @@ async def enqueue_stylize(
     content_path = UPLOAD_DIR / f"content_{timestamp}.png"
     style_path = UPLOAD_DIR / f"style_{timestamp}.png"
     await _save_upload(content_image, content_path)
-    await _save_upload(style_image, style_path)
+    logger.info(f"Upload received: content={content_image.filename} size<= {MAX_UPLOAD_MB}MB")
+    # Style image is optional now; ignored when fast model is used
+    if style_image is not None:
+        try:
+            await _save_upload(style_image, style_path)
+            logger.info(f"Upload received: style={style_image.filename} size<= {MAX_UPLOAD_MB}MB")
+        except HTTPException:
+            # Clean up content file on error
+            try:
+                content_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
 
     import uuid
     job_id = uuid.uuid4().hex
-    async with _JOB_LOCK:
+    if _JOB_LOCK is None:
         _JOBS[job_id] = {
             'status': 'queued',
             'step': 0,
-            'total_steps': steps,
-            'style_weight': style_weight,
+            'total_steps': None,
+            'style_weight': None,
             'created_ts': time.time(),
         }
         _persist_job(job_id)
+    else:
+        async with _JOB_LOCK:
+            _JOBS[job_id] = {
+                'status': 'queued',
+                'step': 0,
+                'total_steps': None,
+                'style_weight': None,
+                'created_ts': time.time(),
+            }
+            _persist_job(job_id)
+    while _JOB_QUEUE is None:
+        await asyncio.sleep(0.01)
+    logger.info(f"Job {job_id}: queued")
     await _JOB_QUEUE.put((job_id, content_path, style_path, steps, style_weight))
     return {"job_id": job_id}
 
@@ -268,10 +360,12 @@ async def get_job(job_id: str):
         # Return image
         if 'result' in job:
             buf: BytesIO = job['result']
+            logger.info(f"Job {job_id}: returning in-memory image result")
             return StreamingResponse(BytesIO(buf.getvalue()), media_type='image/jpeg')
         # load from disk
         rp = _job_result_path(job_id)
         if rp.exists():
+            logger.info(f"Job {job_id}: returning disk-cached image result")
             return StreamingResponse(open(rp, 'rb'), media_type='image/jpeg')
     # If preview available and client wants it, we can embed base64 or separate endpoint.
     resp = {k: v for k, v in job.items() if k not in {'result', 'preview'} and not isinstance(v, (bytes, bytearray))}
@@ -305,7 +399,7 @@ if BASE_PATH:
     @app.post(f"{BASE_PATH}/stylize")
     async def enqueue_stylize_prefixed(
         content_image: UploadFile = File(...),
-        style_image: UploadFile = File(...),
+        style_image: UploadFile = File(None),
         steps: int = Form(200),
         style_weight: float = Form(1_000_000.0),
     ):  # type: ignore

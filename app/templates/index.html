@@ -19,18 +19,14 @@
             <input required type="file" name="content_image" accept="image/*" />
           </label>
           <div class="drop-zone" id="content-drop">Drag & Drop Content Image</div>
-          <label>Style Image
-            <input required type="file" name="style_image" accept="image/*" />
+          <label>Style Image (optional)
+            <input type="file" name="style_image" accept="image/*" />
           </label>
           <div class="drop-zone" id="style-drop">Drag & Drop Style Image</div>
-          <label>Steps (50-500)
-            <input type="number" name="steps" value="200" min="50" max="600" />
-          </label>
-          <label>Style Weight (1e5 - 1e8)
-            <input type="number" name="style_weight" value="1000000" step="100000" />
-          </label>
           <button type="submit">Stylize</button>
-          <div class="hint">Processing uses iterative optimization; higher steps = more style fidelity.</div>
+          <div class="hint">
+            Max upload: {{ max_upload_mb }} MB. Using fast pretrained style{{ ' “' + fast_style_name + '”' if fast_style_name else '' }} for sub-30s results.
+          </div>
           <div id="progress"></div>
           <div class="progress-bar-wrap"><div class="progress-bar" id="progress-bar"></div></div>
           <button id="cancel-btn" type="button" style="display:none; margin-top:.6rem; background:#b91c1c; border:1px solid #7f1d1d;">Cancel</button>
@@ -68,9 +64,28 @@ function setupDropZone(zoneId, inputName) {
 }
 setupDropZone('content-drop', 'content_image');
 setupDropZone('style-drop', 'style_image');
+// Client-side size guard to reduce large uploads
+const MAX_MB = {{ max_upload_mb }};
+function validateSize(input){
+  if(input.files && input.files[0]){
+    if(input.files[0].size > MAX_MB*1024*1024){
+      alert(`File too large. Max ${MAX_MB} MB.`);
+      input.value = '';
+      return false;
+    }
+  }
+  return true;
+}
+Array.from(form.querySelectorAll('input[type="file"]')).forEach(inp=>{
+  inp.addEventListener('change', ()=>validateSize(inp));
+});
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(form);
+  // Ensure sizes are within limit before submission
+  const ci = form.querySelector('input[name="content_image"]');
+  const si = form.querySelector('input[name="style_image"]');
+  if(!validateSize(ci) || (si && si.value && !validateSize(si))){ return; }
   const resultDiv = document.getElementById('result');
   resultDiv.innerHTML = '';
   progressDiv.classList.add('loading');
